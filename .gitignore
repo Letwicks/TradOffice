@@ -1,9 +1,33 @@
+# Python
 __pycache__/
 *.pyc
 *.pyo
+*.pyw
+*.pyz
+
+# PyInstaller
 build/
 dist/
 *.spec
-*.ico
+
+# Ambiente virtual
+venv/
+.env/
+.venv/
+env/
+
+# IDE / Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Cache do app
 cache_traducao.json
 config_tradutor.json
+
+# Icone gerado
+*.ico

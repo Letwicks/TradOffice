@@ -9,12 +9,18 @@ mantendo formatação original (cores, layout, fontes, células mescladas)
 import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext, messagebox
 import tkinter.font as tkfont
-import os, re, json, time, threading, queue, gc, traceback, ctypes
+import os, re, json, time, threading, queue, gc, traceback, ctypes, sys
 from datetime import datetime
 from pathlib import Path
 from deep_translator import GoogleTranslator
 import win32com.client
 import pythoncom
+import urllib.request
+import webbrowser
+
+VERSAO = "1.1"
+REPO_API = "https://api.github.com/repos/Letwicks/TradOffice/releases/latest"
+REPO_URL = "https://github.com/Letwicks/TradOffice/releases"
 
 LINGUAS = [
     "Português (BR)", "English", "Espanhol", "Francês",
@@ -422,10 +428,15 @@ class WorkerThread(threading.Thread):
                     base_trad = re.sub(r'[<>:"/\\|?*]', '', traducao_nomes[base]).strip()
                     if base_trad:
                         base = base_trad
-                    sufixo = "_traduzido"
+                    sufixo = sufixo_padrao
                 else:
                     sufixo = sufixo_padrao
                 path_dest = os.path.join(raiz, f"{base}{sufixo}{ext_dest}")
+                if len(path_dest) > 240:
+                    limite = 240 - len(os.path.join(raiz, sufixo + ext_dest))
+                    if limite > 10:
+                        base = base[:limite]
+                        path_dest = os.path.join(raiz, f"{base}{sufixo}{ext_dest}")
                 arquivos.append((path, path_dest, tipo, item_id))
 
             tradutor = Tradutor(self.lingua_destino, self.cache, lambda m, t="info": self.queue.put(("log", m, t)))
@@ -611,6 +622,9 @@ class TradutorApp:
         barra = tk.Menu(self.root)
         menu_ajuda = tk.Menu(barra, tearoff=0)
         menu_ajuda.add_command(label="Como usar", command=self._mostrar_ajuda)
+        menu_ajuda.add_separator()
+        menu_ajuda.add_command(label="Atualizar", command=self._verificar_atualizacao)
+        menu_ajuda.add_separator()
         menu_ajuda.add_command(label="Sobre", command=self._mostrar_sobre)
         barra.add_cascade(label="Ajuda", menu=menu_ajuda)
         self.root.configure(menu=barra)
@@ -662,7 +676,7 @@ class TradutorApp:
 
     def _mostrar_sobre(self):
         msg = (
-            "Tradutor de Arquivos Office v1.0\n\n"
+            f"Tradutor de Arquivos Office v{VERSAO}\n\n"
             "Traduz conteúdo de arquivos Excel e Word\n"
             "mantendo a formatação original (cores, layout, fontes).\n\n"
             "Tecnologias: Python, Tkinter, deep-translator\n"
@@ -672,6 +686,141 @@ class TradutorApp:
             "© 2026"
         )
         messagebox.showinfo("Sobre", msg)
+
+    def _verificar_atualizacao(self):
+        try:
+            req = urllib.request.Request(REPO_API, headers={"User-Agent": "TradutorOffice"})
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                dados = json.loads(resp.read())
+            ultima = dados.get("tag_name", "").lstrip("v")
+            if not ultima:
+                messagebox.showwarning("Atualização",
+                                       "Não foi possível identificar a versão remota.")
+                return
+            if ultima == VERSAO:
+                messagebox.showinfo("Atualizado",
+                                    f"Você já está na versão mais recente (v{VERSAO}).")
+                return
+
+            corpo = dados.get("body", "Sem detalhes da versão.")
+            nome_release = dados.get("name", f"v{ultima}")
+            asset_url = None
+            for asset in dados.get("assets", []):
+                if asset.get("name", "").endswith(".exe"):
+                    asset_url = asset.get("browser_download_url")
+                    break
+
+            top = tk.Toplevel(self.root)
+            top.title(f"Atualização disponível — {nome_release}")
+            top.geometry("560x480")
+            top.minsize(400, 320)
+            top.transient(self.root)
+            top.grab_set()
+            if self._icone_caminho.exists():
+                try:
+                    top.iconbitmap(default=str(self._icone_caminho))
+                except:
+                    pass
+
+            frame = ttk.Frame(top, padding=12)
+            frame.pack(fill="both", expand=True)
+
+            ttk.Label(frame, text=f"Versão atual: v{VERSAO}    →    {nome_release}",
+                      font=(None, 11, "bold")).pack(anchor="w")
+
+            ttk.Label(frame, text="O que há de novo:",
+                      font=(None, 10, "bold")).pack(anchor="w", pady=(10, 2))
+
+            txt = tk.Text(frame, wrap="word", font=("Segoe UI", 10),
+                          relief="sunken", borderwidth=2, height=12)
+            txt.pack(fill="both", expand=True)
+            scroll = ttk.Scrollbar(frame, orient="vertical", command=txt.yview)
+            txt.configure(yscrollcommand=scroll.set)
+            scroll.pack(side="right", fill="y")
+            txt.pack(side="left", fill="both", expand=True)
+            txt.insert("end", corpo)
+            txt.configure(state="disabled")
+
+            row_btn = ttk.Frame(frame)
+            row_btn.pack(fill="x", pady=(10, 0))
+
+            if asset_url and getattr(sys, 'frozen', False):
+                ttk.Button(row_btn, text="  ⬇ Baixar e Atualizar  ",
+                           command=lambda: self._baixar_atualizar(asset_url, top)
+                           ).pack(side="left", padx=3)
+            elif asset_url and not getattr(sys, 'frozen', False):
+                ttk.Label(row_btn, text="(modo desenvolvimento — abrindo navegador)",
+                          foreground="#888").pack(side="left", padx=3)
+                ttk.Button(row_btn, text="  Abrir Release  ",
+                           command=lambda: webbrowser.open(asset_url)
+                           ).pack(side="left", padx=3)
+            else:
+                ttk.Label(row_btn, text="Nenhum instalador disponível neste release.",
+                          foreground="#888").pack(side="left", padx=3)
+
+            ttk.Button(row_btn, text="Cancelar",
+                       command=top.destroy).pack(side="right", padx=3)
+
+        except Exception as e:
+            messagebox.showerror("Erro", f"Falha ao verificar atualização:\n{e}")
+
+    def _baixar_atualizar(self, url, janela):
+        janela.destroy()
+        try:
+            exe_atual = Path(sys.executable)
+            if not exe_atual.exists():
+                messagebox.showerror("Erro", "Executável não encontrado.")
+                return
+
+            temp_dir = Path(__file__).parent
+            exe_novo = temp_dir / "TradutorOffice.novo.exe"
+            exe_old = temp_dir / "TradutorOffice.old.exe"
+
+            top_prog = tk.Toplevel(self.root)
+            top_prog.title("Baixando atualização...")
+            top_prog.geometry("400x120")
+            top_prog.transient(self.root)
+            top_prog.grab_set()
+            ttk.Label(top_prog, text="Baixando nova versão...",
+                      font=(None, 10, "bold")).pack(pady=(12, 4))
+            prog = ttk.Progressbar(top_prog, mode="indeterminate")
+            prog.pack(fill="x", padx=20, pady=4)
+            lbl = ttk.Label(top_prog, text="")
+            lbl.pack()
+            top_prog.update()
+
+            urllib.request.urlretrieve(url, exe_novo, reporthook=lambda b, bs, ts: (
+                lbl.configure(text=f"{b * bs // 1024} / {ts // 1024} KB"),
+                top_prog.update(),
+            ))
+
+            if not exe_novo.exists():
+                messagebox.showerror("Erro", "Falha ao baixar o arquivo.")
+                return
+
+            top_prog.destroy()
+
+            if messagebox.askyesno("Atualizar",
+                                   "Download concluído. Deseja instalar agora?\n"
+                                   "O aplicativo será fechado e reaberto automaticamente."):
+                import shutil
+                if exe_old.exists():
+                    exe_old.unlink()
+                caminho_bat = temp_dir / "atualizar.bat"
+                caminho_bat.write_text(
+                    f'@echo off\n'
+                    f'timeout /t 2 /nobreak >nul\n'
+                    f'move /y "{exe_atual}" "{exe_old}" >nul 2>&1\n'
+                    f'move /y "{exe_novo}" "{exe_atual}" >nul 2>&1\n'
+                    f'start "" "{exe_atual}"\n'
+                    f'del "%~f0"\n',
+                    encoding="cp1252",
+                )
+                os.startfile(caminho_bat)
+                self.root.quit()
+
+        except Exception as e:
+            messagebox.showerror("Erro", f"Falha ao atualizar:\n{e}")
 
     def _criar_widgets(self):
         # ===== VARIÁVEIS =====
