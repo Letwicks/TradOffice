@@ -2,40 +2,42 @@
 # -*- coding: utf-8 -*-
 """
 Tradutor de Arquivos - Checklist Colaudi
-Interface grafica para traducao de arquivos Excel, Word e PDF
-mantendo formatacao original (cores, layout, fontes, celulas mescladas)
+Interface gráfica para tradução de arquivos Excel e Word
+mantendo formatação original (cores, layout, fontes, células mescladas)
 """
 
 import tkinter as tk
 from tkinter import ttk, filedialog, scrolledtext, messagebox
 import tkinter.font as tkfont
-import os, re, json, time, threading, queue, gc, traceback
+import os, re, json, time, threading, queue, gc, traceback, ctypes
 from datetime import datetime
 from pathlib import Path
 from deep_translator import GoogleTranslator
+import win32com.client
+import pythoncom
 
 LINGUAS = [
-    "Portugues (BR)", "English", "Espanol", "Frances",
-    "Alemao", "Italiano", "Holandes", "Russo",
-    "Chines", "Japones", "Coreano", "Arabe",
-    "Polones", "Turco", "Grego", "Sueco",
+    "Português (BR)", "English", "Espanhol", "Francês",
+    "Alemão", "Italiano", "Holandês", "Russo",
+    "Chinês", "Japonês", "Coreano", "Árabe",
+    "Polonês", "Turco", "Grego", "Sueco",
 ]
 
 COD_LINGUAS = {
-    "Portugues (BR)": "pt", "English": "en", "Espanol": "es",
-    "Frances": "fr", "Alemao": "de", "Italiano": "it",
-    "Holandes": "nl", "Russo": "ru", "Chines": "zh-CN",
-    "Japones": "ja", "Coreano": "ko", "Arabe": "ar",
-    "Polones": "pl", "Turco": "tr", "Grego": "el",
+    "Português (BR)": "pt", "English": "en", "Espanhol": "es",
+    "Francês": "fr", "Alemão": "de", "Italiano": "it",
+    "Holandês": "nl", "Russo": "ru", "Chinês": "zh-CN",
+    "Japonês": "ja", "Coreano": "ko", "Árabe": "ar",
+    "Polonês": "pl", "Turco": "tr", "Grego": "el",
     "Sueco": "sv",
 }
 
 SUFIXO_IDIOMA = {
-    "Portugues (BR)": "PT_BR", "English": "EN", "Espanol": "ES",
-    "Frances": "FR", "Alemao": "DE", "Italiano": "IT",
-    "Holandes": "NL", "Russo": "RU", "Chines": "ZH_CN",
-    "Japones": "JA", "Coreano": "KO", "Arabe": "AR",
-    "Polones": "PL", "Turco": "TR", "Grego": "EL",
+    "Português (BR)": "PT_BR", "English": "EN", "Espanhol": "ES",
+    "Francês": "FR", "Alemão": "DE", "Italiano": "IT",
+    "Holandês": "NL", "Russo": "RU", "Chinês": "ZH_CN",
+    "Japonês": "JA", "Coreano": "KO", "Árabe": "AR",
+    "Polonês": "PL", "Turco": "TR", "Grego": "EL",
     "Sueco": "SV",
 }
 
@@ -128,7 +130,7 @@ class Tradutor:
                     time.sleep(0.4)
                 self.cache.salvar()
             except Exception as e:
-                self.log(f"Falha na traducao: {e}", "error")
+                self.log(f"Falha na tradução: {e}", "error")
                 for t in nao_cache:
                     resultados[t] = self.cache.dados.get(t, t)
         return resultados
@@ -159,9 +161,15 @@ class TradutorArquivos:
         from openpyxl.utils import get_column_letter
 
         wb = openpyxl.load_workbook(path_orig)
+        if self.stop.is_set():
+            wb.close()
+            return False
         textos = set()
 
         for sheet_name in wb.sheetnames:
+            if self.stop.is_set():
+                wb.close()
+                return False
             ws = wb[sheet_name]
             if self.tradutor.texto_valido(sheet_name):
                 textos.add(sheet_name)
@@ -170,9 +178,20 @@ class TradutorArquivos:
                     if cell.value and self.tradutor.texto_valido(str(cell.value)):
                         textos.add(str(cell.value).strip())
 
+        if self.stop.is_set():
+            wb.close()
+            return False
+
         traducoes = self.tradutor.traduzir_batch(list(textos))
 
+        if self.stop.is_set():
+            wb.close()
+            return False
+
         for sheet_name in wb.sheetnames:
+            if self.stop.is_set():
+                wb.close()
+                return False
             ws = wb[sheet_name]
             if sheet_name in traducoes:
                 novo = traducoes[sheet_name][:31]
@@ -267,7 +286,7 @@ class TradutorArquivos:
             excel.Quit()
             return True
 
-        except Exception as e:
+        except BaseException as e:
             self.log(f"  ERRO COM Excel: {e}", "error")
             if wb:
                 try:
@@ -356,68 +375,102 @@ class TradutorArquivos:
                     pass
             return False
 
-    def copiar_pdf(self, path_orig, path_dest):
-        import shutil
-        try:
-            shutil.copy2(path_orig, path_dest)
-            return True
-        except Exception as e:
-            self.log(f"  ERRO PDF: {e}", "error")
-            return False
+
 
 
 # ==================== WORKER ====================
 
 class WorkerThread(threading.Thread):
-    def __init__(self, arquivos, lingua_destino, cache, queue_msg, stop_event):
+    def __init__(self, arquivos, lingua_destino, cache, queue_msg, stop_event,
+                 traduzir_nomes=False):
         super().__init__(daemon=True)
-        self.arquivos = arquivos
+        self.arquivos_raw = arquivos
         self.lingua_destino = lingua_destino
+        self.traduzir_nomes = traduzir_nomes
         self.cache = cache
         self.queue = queue_msg
         self.stop = stop_event
 
     def run(self):
-        tradutor = Tradutor(self.lingua_destino, self.cache, self._log)
-        trad_arq = TradutorArquivos(tradutor, self._log, self._progresso, self.stop)
+        pythoncom.CoInitialize()
+        try:
+            cod = COD_LINGUAS.get(self.lingua_destino, "pt")
+            sufixo_padrao = f"_{SUFIXO_IDIOMA.get(self.lingua_destino, 'PT_BR')}"
 
-        total = len(self.arquivos)
-        for idx, (path_orig, path_dest, tipo) in enumerate(self.arquivos, 1):
-            if self.stop.is_set():
-                self._log("Traducao interrompida pelo usuario.", "warning")
-                self.queue.put(("status", "Interrompido"))
-                return
+            traducao_nomes = {}
+            if self.traduzir_nomes:
+                try:
+                    trad_nomes = GoogleTranslator(source="auto", target=cod)
+                    bases = list(dict.fromkeys(
+                        os.path.splitext(nome)[0] for _, _, _, nome, _ in self.arquivos_raw
+                    ))
+                    if bases:
+                        res = trad_nomes.translate_batch(bases)
+                        for orig, t in zip(bases, res):
+                            traducao_nomes[orig] = t
+                except Exception as e:
+                    self.queue.put(("log", f"Erro ao traduzir nomes: {e}", "warning"))
 
-            nome = os.path.basename(path_orig)
-            self._log(f"[{idx}/{total}] {nome} ...", "info")
-            self._progresso(idx - 1, total, nome)
-
-            inicio = time.time()
-            try:
-                if tipo == "excel":
-                    ok = trad_arq.traduzir_excel(path_orig, path_dest)
-                elif tipo == "word":
-                    ok = trad_arq.traduzir_word(path_orig, path_dest)
-                elif tipo == "pdf":
-                    ok = trad_arq.copiar_pdf(path_orig, path_dest)
+            arquivos = []
+            for item_id, path, raiz, nome, tipo in self.arquivos_raw:
+                base, ext = os.path.splitext(nome)
+                if tipo == "excel" and ext.lower() == ".xls":
+                    ext_dest = ".xlsx"
                 else:
-                    ok = False
-
-                decorrido = time.time() - inicio
-                if ok:
-                    self._log(f"  OK ({decorrido:.0f}s)", "success")
+                    ext_dest = ext
+                if self.traduzir_nomes and base in traducao_nomes:
+                    base_trad = re.sub(r'[<>:"/\\|?*]', '', traducao_nomes[base]).strip()
+                    if base_trad:
+                        base = base_trad
+                    sufixo = "_traduzido"
                 else:
-                    self._log(f"  FALHA ({decorrido:.0f}s)", "error")
-            except Exception as e:
-                self._log(f"  ERRO: {e}", "error")
+                    sufixo = sufixo_padrao
+                path_dest = os.path.join(raiz, f"{base}{sufixo}{ext_dest}")
+                arquivos.append((path, path_dest, tipo, item_id))
 
-            self._progresso(idx, total, nome)
-            gc.collect()
+            tradutor = Tradutor(self.lingua_destino, self.cache, lambda m, t="info": self.queue.put(("log", m, t)))
+            trad_arq = TradutorArquivos(tradutor, lambda m, t="info": self.queue.put(("log", m, t)),
+                                        self._progresso, self.stop)
 
-        self.cache.salvar()
-        self._log("Traducao concluida!", "success")
-        self.queue.put(("status", "Concluido"))
-        self.queue.put(("pronto", None))
+            total = len(arquivos)
+            for idx, (path_orig, path_dest, tipo, item_id) in enumerate(arquivos, 1):
+                if self.stop.is_set():
+                    self._log("Tradução interrompida pelo usuário.", "warning")
+                    self.queue.put(("status", "Interrompido"))
+                    self.queue.put(("pronto", None))
+                    return
+
+                nome = os.path.basename(path_orig)
+                self._log(f"[{idx}/{total}] {nome} ...", "info")
+                self._progresso(idx - 1, total, nome)
+
+                inicio = time.time()
+                try:
+                    if tipo == "excel":
+                        ok = trad_arq.traduzir_excel(path_orig, path_dest)
+                    elif tipo == "word":
+                        ok = trad_arq.traduzir_word(path_orig, path_dest)
+                    else:
+                        ok = False
+
+                    decorrido = time.time() - inicio
+                    if ok:
+                        self._log(f"  OK ({decorrido:.0f}s)", "success")
+                    else:
+                        self._log(f"  FALHA ({decorrido:.0f}s)", "error")
+                except Exception as e:
+                    self._log(f"  ERRO: {e}", "error")
+
+                self._progresso(idx, total, nome)
+                self.queue.put(("item_pronto", item_id))
+                gc.collect()
+
+            self.cache.salvar()
+            self._log("Tradução concluída!", "success")
+            self.queue.put(("status", "Concluído"))
+            self.queue.put(("pronto", None))
+        finally:
+            pythoncom.CoUninitialize()
 
     def _log(self, msg, tipo="info"):
         self.queue.put(("log", msg, tipo))
@@ -426,12 +479,12 @@ class WorkerThread(threading.Thread):
         self.queue.put(("progresso", atual, total, arquivo))
 
 
-# ==================== INTERFACE GRAFICA ====================
+# ==================== INTERFACE GRÁFICA ====================
 
 class TradutorApp:
     def __init__(self):
         self.root = tk.Tk()
-        self.root.title("Tradutor de aquivos office")
+        self.root.title("Tradutor de arquivos office")
         self.root.geometry("960x740")
         self.root.minsize(750, 620)
 
@@ -586,20 +639,20 @@ class TradutorApp:
 
         txt.insert("end", "COMO USAR O TRADUTOR DE ARQUIVOS OFFICE\n\n", "titulo")
         txt.insert("end", "1. Selecione a pasta raiz com os arquivos clicando em 📁.\n")
-        txt.insert("end", "2. Escolha os tipos de arquivo desejados (Excel, Word, PDF).\n")
+        txt.insert("end", "2. Escolha os tipos de arquivo desejados (Excel, Word).\n")
         txt.insert("end", "3. Selecione o idioma de destino no menu suspenso.\n")
-        txt.insert('end', '4. Marque "Trad. nomes" se quiser traduzir tambem os nomes dos arquivos.\n')
+        txt.insert('end', '4. Marque "Trad. nomes" se quiser traduzir também os nomes dos arquivos.\n')
         txt.insert("end", "5. Clique em 🔍 Escanear para listar os arquivos encontrados.\n")
-        txt.insert("end", "6. Clique na coluna de selecao (☐/☑) para marcar/desmarcar arquivos.\n")
-        txt.insert("end", "   Use a tecla Espaco para alternar a selecao do item em foco.\n")
-        txt.insert("end", "7. Clique em ▶ Iniciar Traducao para comecar.\n\n")
-        txt.insert("end", "Os arquivos traduzidos serao salvos com o sufixo do idioma\n")
+        txt.insert("end", "6. Clique na coluna de seleção (☐/☑) para marcar/desmarcar arquivos.\n")
+        txt.insert("end", "   Use a tecla Espaço para alternar a seleção do item em foco.\n")
+        txt.insert("end", "7. Clique em ▶ Iniciar Tradução para começar.\n\n")
+        txt.insert("end", "Os arquivos traduzidos serão salvos com o sufixo do idioma\n")
         txt.insert("end", "(ex.: _PT_BR) ao lado do arquivo original.\n\n")
         txt.insert("end", "Use ⏹ Parar para interromper a qualquer momento.\n")
-        txt.insert("end", "O botao Limpar Cache apaga o cache de traducoes\n")
-        txt.insert("end", "para forcar uma retraducao completa.\n\n")
-        txt.insert("end", "DICA: Arquivos com _traduzido no nome sao ignorados\n")
-        txt.insert("end", "automaticamente para evitar retraducao.", "dica")
+        txt.insert("end", "O botão Limpar Cache apaga o cache de traduções\n")
+        txt.insert("end", "para forçar uma retradução completa.\n\n")
+        txt.insert("end", "DICA: Arquivos com _traduzido no nome são ignorados\n")
+        txt.insert("end", "automaticamente para evitar retradução.", "dica")
 
         txt.tag_configure("titulo", font=("Segoe UI", 12, "bold"), spacing3=8)
         txt.tag_configure("dica", foreground="#0044aa", font=("Segoe UI", 10, "italic"))
@@ -610,25 +663,26 @@ class TradutorApp:
     def _mostrar_sobre(self):
         msg = (
             "Tradutor de Arquivos Office v1.0\n\n"
-            "Traduz conteudo de arquivos Excel, Word e PDF\n"
-            "mantendo a formatacao original (cores, layout, fontes).\n\n"
+            "Traduz conteúdo de arquivos Excel e Word\n"
+            "mantendo a formatação original (cores, layout, fontes).\n\n"
             "Tecnologias: Python, Tkinter, deep-translator\n"
-            "Padroes: WCAG AA, ISO 9241-115/161, HIG\n\n"
+            "Padrões: WCAG AA, ISO 9241-115/161, HIG\n\n"
+            "Desenvolvido por Autolinx Automação\n"
+            "http://autolinx.me\n\n"
             "© 2026"
         )
         messagebox.showinfo("Sobre", msg)
 
     def _criar_widgets(self):
-        # ===== VARIAVEIS =====
+        # ===== VARIÁVEIS =====
         self.var_pasta = tk.StringVar(value=self._ultimo_dir)
         self.var_excel = tk.BooleanVar(value=True)
         self.var_word = tk.BooleanVar(value=True)
-        self.var_pdf = tk.BooleanVar(value=True)
-        self.var_lingua = tk.StringVar(value="Portugues (BR)")
+        self.var_lingua = tk.StringVar(value="Português (BR)")
         self.var_traduzir_nomes = tk.BooleanVar(value=False)
 
         # ===== FRAME TOPO =====
-        frame_topo = ttk.LabelFrame(self.root, text="Configuracao", padding=12)
+        frame_topo = ttk.LabelFrame(self.root, text="Configuração", padding=12)
         frame_topo.pack(fill="x", padx=12, pady=(12, 6))
 
         # Pasta
@@ -649,8 +703,6 @@ class TradutorApp:
         self.chk_excel.pack(side="left", padx=(0, 12))
         self.chk_word = ttk.Checkbutton(row_tipos, text="Word (.doc/.docx)", variable=self.var_word)
         self.chk_word.pack(side="left", padx=(0, 12))
-        self.chk_pdf = ttk.Checkbutton(row_tipos, text="PDF", variable=self.var_pdf)
-        self.chk_pdf.pack(side="left")
 
         # Idioma + Botoes
         row_idioma = ttk.Frame(frame_topo)
@@ -694,6 +746,7 @@ class TradutorApp:
         self.tree.bind("<ButtonRelease-1>", self._toggle_check)
         self.tree.bind("<space>", self._toggle_check_key)
         self.tree.bind("<FocusIn>", lambda e: self.tree.focus_set())
+        self.tree.tag_configure("traduzido", background="#C5E1F5")
 
         scroll_y = ttk.Scrollbar(frame_lista, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=scroll_y.set)
@@ -731,12 +784,12 @@ class TradutorApp:
         self.txt_log.tag_configure("error", foreground="#b30000")
         self.txt_log.tag_configure("highlight", foreground="#0044aa")
 
-        # ===== FRAME BOTOES =====
+        # ===== FRAME BOTÕES =====
         frame_botoes = ttk.Frame(self.root, padding=6)
         frame_botoes.pack(fill="x", padx=12, pady=(0, 12))
 
         self.btn_iniciar = ttk.Button(
-            frame_botoes, text="  ▶ Iniciar Traducao  ",
+            frame_botoes, text="  ▶ Iniciar Tradução  ",
             command=self._iniciar, style="Accent.TButton",
         )
         self.btn_iniciar.pack(side="left", padx=3)
@@ -764,7 +817,7 @@ class TradutorApp:
     def _escanear(self):
         pasta = self.var_pasta.get().strip()
         if not pasta or not os.path.isdir(pasta):
-            messagebox.showwarning("Aviso", "Selecione uma pasta valida.")
+            messagebox.showwarning("Aviso", "Selecione uma pasta válida.")
             return
 
         self._log("Escaneando arquivos...", "info")
@@ -775,7 +828,6 @@ class TradutorApp:
 
         incluir_excel = self.var_excel.get()
         incluir_word = self.var_word.get()
-        incluir_pdf = self.var_pdf.get()
 
         encontrados = 0
         for raiz, _, arquivos in os.walk(pasta):
@@ -784,16 +836,12 @@ class TradutorApp:
                 if "_traduzido" in fl:
                     continue
                 path = os.path.join(raiz, f)
-                if os.path.getsize(path) == 0:
-                    continue
 
                 tipo = None
                 if incluir_excel and (fl.endswith(".xls") or fl.endswith(".xlsx")):
                     tipo = "excel"
                 elif incluir_word and (fl.endswith(".doc") or fl.endswith(".docx")):
                     tipo = "word"
-                elif incluir_pdf and fl.endswith(".pdf"):
-                    tipo = "pdf"
 
                 if tipo is None:
                     continue
@@ -852,43 +900,9 @@ class TradutorApp:
             return
 
         selecionados = []
-
-        traducao_nomes = {}
-        if self.var_traduzir_nomes.get():
-            cod = COD_LINGUAS.get(self.var_lingua.get(), "pt")
-            trad_nomes = GoogleTranslator(source="auto", target=cod)
-            bases = [
-                os.path.splitext(nome)[0]
-                for item_id, _, _, nome, _ in self.arquivos_info
-                if self.arquivos_check.get(item_id, False)
-            ]
-            bases_unicas = list(dict.fromkeys(bases))
-            if bases_unicas:
-                try:
-                    res = trad_nomes.translate_batch(bases_unicas)
-                    for orig, t in zip(bases_unicas, res):
-                        traducao_nomes[orig] = t
-                except:
-                    pass
-
         for item_id, path, raiz, nome, tipo in self.arquivos_info:
             if self.arquivos_check.get(item_id, False):
-                base, ext = os.path.splitext(nome)
-                if tipo == "excel" and ext.lower() == ".xls":
-                    ext_dest = ".xlsx"
-                else:
-                    ext_dest = ext
-                if self.var_traduzir_nomes.get() and base in traducao_nomes:
-                    base_trad = traducao_nomes[base]
-                    base_trad = re.sub(r'[<>:"/\\|?*]', '', base_trad).strip()
-                    if base_trad:
-                        base = base_trad
-                    sufixo = "_traduzido"
-                else:
-                    sufixo = f"_{SUFIXO_IDIOMA.get(self.var_lingua.get(), 'Pt-Br')}"
-                nome_dest = f"{base}{sufixo}{ext_dest}"
-                path_dest = os.path.join(raiz, nome_dest)
-                selecionados.append((path, path_dest, tipo))
+                selecionados.append((item_id, path, raiz, nome, tipo))
 
         if not selecionados:
             messagebox.showwarning("Aviso", "Selecione pelo menos um arquivo.")
@@ -909,14 +923,23 @@ class TradutorApp:
         lingua = self.var_lingua.get()
         self.worker = WorkerThread(
             selecionados, lingua, self.cache, self.queue_app, self.stop_event,
+            traduzir_nomes=self.var_traduzir_nomes.get(),
         )
         self.worker.start()
 
     def _parar(self):
         if self.worker and self.worker.is_alive():
             self.stop_event.set()
-            self._log("Solicitada parada (aguardando arquivo atual)...", "warning")
-            self.btn_parar["state"] = "disabled"
+            ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                ctypes.c_long(self.worker.ident),
+                ctypes.py_object(SystemExit),
+            )
+            self._log("Parada solicitada.", "warning")
+        self.btn_parar["state"] = "disabled"
+        self.btn_iniciar["state"] = "normal"
+        self.lbl_status["text"] = "Interrompido"
+        self.lbl_status["foreground"] = "#b8860b"
+        self.progresso_bar["value"] = 0
 
     def _poll_queue(self):
         try:
@@ -935,15 +958,18 @@ class TradutorApp:
                 elif tipo == "status":
                     _, texto = msg
                     self.lbl_status["text"] = texto
-                    if texto == "Concluido":
+                    if texto == "Concluído":
                         self.lbl_status["foreground"] = "#1a8a1a"
                     elif texto == "Interrompido":
                         self.lbl_status["foreground"] = "#b8860b"
+                elif tipo == "item_pronto":
+                    _, item_id = msg
+                    self.tree.item(item_id, tags=("traduzido",))
                 elif tipo == "pronto":
                     self.btn_iniciar["state"] = "normal"
                     self.btn_parar["state"] = "disabled"
                     if not self.stop_event.is_set():
-                        messagebox.showinfo("Concluido", "Traducao finalizada com sucesso!")
+                        messagebox.showinfo("Concluído", "Tradução finalizada com sucesso!")
         except queue.Empty:
             pass
 
@@ -957,7 +983,7 @@ class TradutorApp:
         self.txt_log.configure(state="disabled")
 
     def _limpar_cache(self):
-        if messagebox.askyesno("Limpar Cache", "Limpar cache de traducoes?"):
+        if messagebox.askyesno("Limpar Cache", "Limpar cache de traduções?"):
             self.cache.dados.clear()
             self.cache.salvar()
             self._log(f"Cache limpo.", "warning")
