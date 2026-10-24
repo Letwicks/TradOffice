@@ -28,6 +28,13 @@ Thumbs.db
 # Cache do app
 cache_traducao.json
 config_tradutor.json
+*.json.tmp
+*.corrompido.json
+
+# Atualizador
+atualizar.bat
+TradutorOffice.novo.exe
+TradutorOffice.old.exe
 
 # Icone gerado
 *.ico
